@@ -24,24 +24,29 @@ def extract_manga_id(url: str) -> str:
     return None
 
 def get_manga_info(manga_id: str):
-    """Fetches metadata about the manga."""
+    """Fetches metadata about the manga, including title and available languages."""
     resp = requests.get(f"{API_BASE}/manga/{manga_id}")
     resp.raise_for_status()
     data = resp.json()['data']
     
     title_data = data['attributes']['title']
     title = title_data.get('en') or list(title_data.values())[0]
-    return title
 
-def get_chapters(manga_id: str):
-    """Fetches all English chapters for a given manga, handling pagination."""
+    languages = data['attributes'].get('availableTranslatedLanguages', ['en'])
+    # Sometimes availableTranslatedLanguages can contain None, filter it out
+    languages = [lang for lang in languages if lang is not None]
+
+    return title, languages
+
+def get_chapters(manga_id: str, language: str = "en"):
+    """Fetches all chapters for a given manga in a specific language, handling pagination."""
     chapters = []
     limit = 500
     offset = 0
     
     while True:
         params = {
-            "translatedLanguage[]": "en",
+            "translatedLanguage[]": language,
             "order[chapter]": "asc",
             "limit": limit,
             "offset": offset,
@@ -118,82 +123,145 @@ def download_image(url: str, filepath: str):
             else:
                 time.sleep(2) # Wait before retry
 
+def download_chapter(ch, safe_title, show_progress=True):
+    ch_num = ch['attributes']['chapter']
+    ch_title = ch['attributes']['title'] or ''
+    ch_id = ch['id']
+
+    # Format chapter folder name
+    folder_name = f"Chapter {ch_num}" if ch_num else "Oneshot"
+    if ch_title:
+        safe_ch_title = sanitize_filename(ch_title)
+        folder_name += f" - {safe_ch_title}"
+
+    ch_dir = os.path.join(safe_title, folder_name)
+    os.makedirs(ch_dir, exist_ok=True)
+
+    if show_progress:
+        print(f"Downloading {folder_name}...")
+
+    try:
+        pages = get_chapter_pages(ch_id)
+        total_pages = len(pages)
+
+        for i, page_url in enumerate(pages):
+            # Use 3 digits for page number to keep them sorted (e.g., 001.jpg)
+            page_ext = page_url.split('.')[-1]
+            if len(page_ext) > 4 or not page_ext.isalnum():
+                page_ext = "jpg" # fallback
+
+            page_filename = f"{i+1:03d}.{page_ext}"
+            page_filepath = os.path.join(ch_dir, page_filename)
+
+            if show_progress:
+                sys.stdout.write(f"\r  Page {i+1}/{total_pages}")
+                sys.stdout.flush()
+
+            download_image(page_url, page_filepath)
+
+        if show_progress:
+            print() # New line after chapter finishes
+        else:
+            print(f"Finished {folder_name}")
+    except requests.exceptions.RequestException as e:
+        print(f"\n  Error fetching pages for chapter {ch_num}: {e}")
+
+    time.sleep(1) # Be nice between chapters
+
+import concurrent.futures
+
 def main():
     parser = argparse.ArgumentParser(description="Download manga from MangaDex.")
-    parser.add_argument("url", help="MangaDex URL or Manga ID")
+    parser.add_argument("url", nargs="?", help="MangaDex URL or Manga ID")
+    parser.add_argument("-f", "--file", help="Text file containing multiple MangaDex URLs or IDs (one per line)")
+    parser.add_argument("-p", "--parallel", type=int, default=1, help="Number of concurrent chapter downloads (default: 1)")
     parser.add_argument("--chapters", type=int, default=None, help="Number of chapters to download (default: all)")
     args = parser.parse_args()
 
-    manga_id = extract_manga_id(args.url)
-    if not manga_id:
-        print("Error: Invalid MangaDex URL or ID.")
+    urls = []
+    if args.url:
+        urls.append(args.url)
+    if args.file:
+        try:
+            with open(args.file, "r") as f:
+                urls.extend([line.strip() for line in f if line.strip()])
+        except Exception as e:
+            print(f"Error reading file {args.file}: {e}")
+            sys.exit(1)
+
+    if not urls:
+        print("Error: Please provide a MangaDex URL/ID or a file containing URLs/IDs.")
+        parser.print_help()
         sys.exit(1)
+
+    for url in urls:
+        manga_id = extract_manga_id(url)
+        if not manga_id:
+            print(f"Error: Invalid MangaDex URL or ID: {url}")
+            continue
         
-    print(f"Extracting Manga ID: {manga_id}")
+        print(f"\n--- Extracting Manga ID: {manga_id} ---")
     
-    try:
-        title = get_manga_info(manga_id)
-        safe_title = sanitize_filename(title)
-        print(f"Manga Title: {title}")
-        
-        # Create manga directory
-        os.makedirs(safe_title, exist_ok=True)
-        
-        print("Fetching chapter list...")
-        chapters = get_chapters(manga_id)
-        print(f"Found {len(chapters)} unique English chapters.")
-        
-        # Limit chapters if specified
-        if args.chapters is not None:
-            chapters = chapters[:args.chapters]
-            print(f"Limiting to the first {args.chapters} chapters.")
-        
-        if chapters:
-            for ch in chapters:
-                ch_num = ch['attributes']['chapter']
-                ch_title = ch['attributes']['title'] or ''
-                ch_id = ch['id']
+        try:
+            title, languages = get_manga_info(manga_id)
+            safe_title = sanitize_filename(title)
+            print(f"Manga Title: {title}")
+
+            # Present languages and prompt
+            if not languages:
+                print("No translated languages found for this manga.")
+                continue
                 
-                # Format chapter folder name
-                folder_name = f"Chapter {ch_num}" if ch_num else "Oneshot"
-                if ch_title:
-                    safe_ch_title = sanitize_filename(ch_title)
-                    folder_name += f" - {safe_ch_title}"
-                    
-                ch_dir = os.path.join(safe_title, folder_name)
-                os.makedirs(ch_dir, exist_ok=True)
+            print("Available languages:")
+            for i, lang in enumerate(languages):
+                print(f"{i+1}. {lang}")
                 
-                print(f"Downloading {folder_name}...")
-                
+            selected_lang = None
+            while selected_lang is None:
                 try:
-                    pages = get_chapter_pages(ch_id)
-                    total_pages = len(pages)
+                    choice = input(f"Select a language (1-{len(languages)}) [default: 1]: ").strip()
+                    if not choice:
+                        selected_lang = languages[0]
+                    else:
+                        idx = int(choice) - 1
+                        if 0 <= idx < len(languages):
+                            selected_lang = languages[idx]
+                        else:
+                            print("Invalid selection. Please try again.")
+                except ValueError:
+                    print("Invalid input. Please enter a number.")
                     
-                    for i, page_url in enumerate(pages):
-                        # Use 3 digits for page number to keep them sorted (e.g., 001.jpg)
-                        page_ext = page_url.split('.')[-1]
-                        if len(page_ext) > 4 or not page_ext.isalnum():
-                            page_ext = "jpg" # fallback
-                            
-                        page_filename = f"{i+1:03d}.{page_ext}"
-                        page_filepath = os.path.join(ch_dir, page_filename)
-                        
-                        sys.stdout.write(f"\r  Page {i+1}/{total_pages}")
-                        sys.stdout.flush()
-                        
-                        download_image(page_url, page_filepath)
-                        
-                    print() # New line after chapter finishes
-                except requests.exceptions.RequestException as e:
-                    print(f"\n  Error fetching pages for chapter {ch_num}: {e}")
-                
-                time.sleep(1) # Be nice between chapters
-                
-        print("\nDownload complete!")
-                
-    except requests.exceptions.RequestException as e:
-        print(f"Error connecting to MangaDex API: {e}")
-        sys.exit(1)
+            print(f"Selected language: {selected_lang}")
+
+            # Create manga directory
+            os.makedirs(safe_title, exist_ok=True)
+
+            print(f"Fetching chapter list for language '{selected_lang}'...")
+            chapters = get_chapters(manga_id, selected_lang)
+            print(f"Found {len(chapters)} unique chapters.")
+
+            # Limit chapters if specified
+            if args.chapters is not None:
+                chapters = chapters[:args.chapters]
+                print(f"Limiting to the first {args.chapters} chapters.")
+
+            if chapters:
+                show_progress = (args.parallel == 1)
+                if args.parallel > 1:
+                    print(f"Starting download of {len(chapters)} chapters in parallel ({args.parallel} workers)...")
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=args.parallel) as executor:
+                        futures = [executor.submit(download_chapter, ch, safe_title, show_progress) for ch in chapters]
+                        concurrent.futures.wait(futures)
+                else:
+                    for ch in chapters:
+                        download_chapter(ch, safe_title, show_progress)
+
+            print("\nDownload complete!")
+
+        except requests.exceptions.RequestException as e:
+            print(f"Error connecting to MangaDex API: {e}")
+            # continue with next url instead of exiting
+            continue
 
 if __name__ == "__main__":
     main()
